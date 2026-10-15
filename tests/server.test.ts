@@ -230,3 +230,72 @@ test("a missing reference fails review without altering the original", async () 
     await harness.lifecycle.dispose();
   }
 });
+
+test("answers start a fresh review that carries the earlier rewrite", async () => {
+  const { harness } = await setup();
+  try {
+    const first = (await harness.behavior.callRpc("startReview", input)) as {
+      id: string;
+    };
+    await wait(
+      () => harness.inspection.sdk.callsTo("threads.spawn").length === 1,
+    );
+    await new Promise((r) => setImmediate(r));
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: "review-child" }),
+      lastAssistantText: JSON.stringify({
+        prompt: "Please fix the crash in src/a.ts.",
+        changes: ["Named the outcome"],
+        questions: [
+          { question: "Which crash?", options: ["On load", "On save"] },
+        ],
+        recommendations: [],
+      }),
+    });
+    const answers = [{ question: "Which crash?", answer: "On save" }];
+    const refined = (await harness.behavior.callRpc("startReview", {
+      ...input,
+      refineFrom: first.id,
+      answers,
+    })) as { id: string; answers: unknown };
+    assert.notEqual(refined.id, first.id);
+    assert.deepEqual(refined.answers, answers);
+    const again = (await harness.behavior.callRpc("startReview", {
+      ...input,
+      refineFrom: first.id,
+      answers,
+    })) as { id: string };
+    assert.equal(again.id, refined.id, "identical answers are deduplicated");
+    await wait(
+      () => harness.inspection.sdk.callsTo("threads.spawn").length === 2,
+    );
+    const prompt = String(
+      (
+        harness.inspection.sdk.callsTo("threads.spawn")[1]![0] as {
+          prompt: string;
+        }
+      ).prompt,
+    );
+    assert.match(prompt, /REFINEMENT/);
+    assert.ok(
+      prompt.includes('"previousPrompt":"Please fix the crash in src/a.ts."'),
+    );
+    assert.ok(prompt.includes('"answer":"On save"'));
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("answers without the review they belong to are rejected", async () => {
+  const { harness } = await setup();
+  try {
+    await assert.rejects(() =>
+      harness.behavior.callRpc("startReview", {
+        ...input,
+        answers: [{ question: "Which crash?", answer: "On save" }],
+      }),
+    );
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});

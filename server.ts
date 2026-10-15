@@ -1,6 +1,7 @@
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
+  answerSchema,
   buildReviewPrompt,
   catalogSchema,
   recommendationSchema,
@@ -12,6 +13,7 @@ import {
   type ReviewSelection,
 } from "./lib/review";
 import { machineContract } from "./lib/machine-contract";
+import { DEFAULT_PAUSE_MS } from "./lib/trigger";
 
 export const runSchema = z.object({
   id: z.string(),
@@ -23,6 +25,7 @@ export const runSchema = z.object({
   status: z.enum(["pending", "done", "error", "cancelled"]),
   review: reviewSchema.nullable(),
   catalog: catalogSchema.nullable(),
+  answers: z.array(answerSchema).nullable(),
   error: z.string().nullable(),
   createdAt: z.number(),
   deadline: z.number(),
@@ -41,8 +44,12 @@ export const rpcContract = defineRpcContract({
         selection: reviewSelectionSchema,
         mentionLabels: z.array(z.string().max(1000)).max(100),
         attachmentCount: z.number().int().min(0).max(100),
+        // Answers to the questions of review `refineFrom`, folded into a fresh review.
+        refineFrom: z.string().max(100).optional(),
+        answers: z.array(answerSchema).min(1).max(3).optional(),
       })
-      .strict(),
+      .strict()
+      .refine((x) => !x.answers === !x.refineFrom),
     output: runSchema,
   },
   getReview: {
@@ -83,6 +90,8 @@ interface Row {
   status: Run["status"];
   review: string | null;
   catalog: string | null;
+  answers: string | null;
+  refine_from: string | null;
   error: string | null;
   created_at: number;
   deadline: number;
@@ -95,14 +104,14 @@ export default async function plugin(bb: BbPluginApi) {
       type: "boolean",
       label: "Automatically review new-thread prompts",
       description:
-        "Review after a pause in typing. Draft and settings change only when you apply a recommendation.",
+        "Review after a pause in typing, only when the draft ends on a finished sentence. Review on demand with Ctrl/⌘+Shift+R or Review now. Draft and settings change only when you apply a recommendation.",
       default: true,
     },
     debounceMs: {
       type: "number",
-      label: "Pause before review (milliseconds)",
-      default: 2500,
-      experimental_schema: z.number().int().min(1000).max(30000),
+      label: "Pause before automatic review (milliseconds)",
+      default: DEFAULT_PAUSE_MS,
+      experimental_schema: z.number().int().min(5000).max(600000),
     },
     reviewerHost: {
       type: "string",
@@ -144,9 +153,11 @@ export default async function plugin(bb: BbPluginApi) {
   bb.storage.migrate(db, [
     `CREATE TABLE reviews (id TEXT PRIMARY KEY,scope_key TEXT NOT NULL,fingerprint TEXT NOT NULL,original TEXT NOT NULL,selection TEXT NOT NULL,resolved_selection TEXT,mentions TEXT NOT NULL,attachments INTEGER NOT NULL,child_id TEXT,status TEXT NOT NULL,review TEXT,catalog TEXT,error TEXT,created_at INTEGER NOT NULL,deadline INTEGER NOT NULL,dismissed INTEGER NOT NULL DEFAULT 0)`,
     `CREATE INDEX reviews_scope ON reviews(scope_key,created_at)`,
+    `ALTER TABLE reviews ADD COLUMN answers TEXT`,
+    `ALTER TABLE reviews ADD COLUMN refine_from TEXT`,
   ]);
   const insert = db.prepare(
-    `INSERT INTO reviews(id,scope_key,fingerprint,original,selection,mentions,attachments,status,created_at,deadline) VALUES(?,?,?,?,?,?,?,'pending',?,?)`,
+    `INSERT INTO reviews(id,scope_key,fingerprint,original,selection,mentions,attachments,answers,refine_from,status,created_at,deadline) VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?)`,
   );
   const byId = db.prepare("SELECT * FROM reviews WHERE id=?");
   const pending = db.prepare("SELECT * FROM reviews WHERE status='pending'");
@@ -182,6 +193,9 @@ export default async function plugin(bb: BbPluginApi) {
         r.status === "done" && r.catalog
           ? catalogSchema.parse(JSON.parse(r.catalog))
           : null,
+      answers: r.answers
+        ? z.array(answerSchema).parse(JSON.parse(r.answers))
+        : null,
       error: r.error,
       createdAt: r.created_at,
       deadline: r.deadline,
@@ -463,6 +477,19 @@ export default async function plugin(bb: BbPluginApi) {
       const selection = await resolveSelection(dto(r).selection);
       const catalog = await loadCatalog(selection);
       const prefs = await settings.get();
+      const base = r.refine_from ? row(r.refine_from) : undefined;
+      const refinement =
+        base?.review && base.scope_key === r.scope_key && r.answers
+          ? {
+              previousPrompt: reviewSchema.parse(JSON.parse(base.review))
+                .prompt,
+              answers: z.array(answerSchema).parse(JSON.parse(r.answers)),
+            }
+          : null;
+      if (r.refine_from && !refinement)
+        throw new ReviewFailure(
+          "The review those answers belong to is no longer available. Review again.",
+        );
       const target = catalog.targets.find(
         (t) =>
           t.projectId === selection.projectId && t.hostId === selection.hostId,
@@ -520,6 +547,7 @@ export default async function plugin(bb: BbPluginApi) {
           catalog,
           r.attachments,
           prefs.customInstructions,
+          refinement,
         ),
       });
       if (disposed) {
@@ -545,8 +573,10 @@ export default async function plugin(bb: BbPluginApi) {
   bb.rpc.register(rpcContract, {
     async startReview(input) {
       const previous = latest.get(input.scopeKey) as Row | undefined;
+      const answers = input.answers ? JSON.stringify(input.answers) : null;
       if (
         previous?.fingerprint === input.fingerprint &&
+        previous.answers === answers &&
         previous.status !== "error" &&
         previous.status !== "cancelled"
       )
@@ -572,6 +602,8 @@ export default async function plugin(bb: BbPluginApi) {
         JSON.stringify(input.selection),
         JSON.stringify(input.mentionLabels),
         input.attachmentCount,
+        answers,
+        input.refineFrom ?? null,
         now,
         now + 180000,
       );

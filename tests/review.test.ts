@@ -199,3 +199,67 @@ test("remaps repeated structured references and refuses a lost occurrence", () =
     /mention/,
   );
 });
+
+test("reviews carry terse changes and answerable questions; older reviews still load", () => {
+  const current = parseReview(
+    JSON.stringify({
+      prompt: "Fix src/a.ts",
+      changes: ["Named the outcome"],
+      questions: [{ question: "Which crash?", options: ["On load"] }],
+      recommendations: [],
+    }),
+    "Fix src/a.ts",
+    [],
+  );
+  assert.deepEqual(current.questions, [
+    { question: "Which crash?", options: ["On load"] },
+  ]);
+  assert.deepEqual(current.changes, ["Named the outcome"]);
+  const legacy = parseReview(review(), "Fix src/a.ts", []);
+  assert.deepEqual(legacy.changes, []);
+  assert.equal(legacy.summary, "Clarified the outcome.");
+  const legacyQuestion = parseReview(
+    JSON.stringify({
+      prompt: "Fix src/a.ts",
+      summary: "x",
+      questions: ["Which crash?"],
+      recommendations: [],
+    }),
+    "Fix src/a.ts",
+    [],
+  );
+  assert.deepEqual(legacyQuestion.questions, [
+    { question: "Which crash?", options: [] },
+  ]);
+});
+
+test("the rubric asks for a substantive rewrite without widening authority", () => {
+  const prompt = buildReviewPrompt(
+    "look into why openclaw makes dup threads",
+    selection,
+    catalog,
+    0,
+    "",
+  );
+  assert.match(prompt, /not a light copy-edit/);
+  assert.match(prompt, /must not become permission to change things/);
+  assert.match(prompt, /never complete a trailing fragment/);
+  assert.match(prompt, /"changes"/);
+  assert.doesNotMatch(prompt, /REFINEMENT/);
+  const refined = buildReviewPrompt(
+    "look into why openclaw makes dup threads",
+    selection,
+    catalog,
+    0,
+    "",
+    {
+      previousPrompt: "Investigate duplicate threads.",
+      answers: [{ question: "Which surface?", answer: "Slack" }],
+    },
+  );
+  assert.match(refined, /REFINEMENT/);
+  assert.match(refined, /never as a Q&A appendix/);
+  assert.ok(
+    refined.includes('"previousPrompt":"Investigate duplicate threads."'),
+  );
+});

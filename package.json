@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-prompt-advisor",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "license": "MIT",
   "engines": {
@@ -55,7 +55,7 @@
   "scripts": {
     "test": "node --import tsx --test \"tests/*.test.ts\" \"tests/*.test.tsx\"",
     "typecheck": "tsc --noEmit",
-    "format:check": "prettier --check app.tsx server.ts host.ts lib/review.ts lib/machine-contract.ts lib/composer-owner.ts tests/composer-owner.test.ts tests/app.test.tsx tests/server.test.ts tests/review.test.ts verification/preview.tsx README.md skills/prompt-advisor/SKILL.md"
+    "format:check": "prettier --check app.tsx server.ts host.ts lib/review.ts lib/machine-contract.ts lib/composer-owner.ts lib/trigger.ts lib/diff.ts tests/dom.ts tests/trigger.test.ts tests/composer-owner.test.ts tests/app.test.tsx tests/server.test.ts tests/review.test.ts verification/preview.tsx README.md skills/prompt-advisor/SKILL.md"
   },
   "allowScripts": {
     "better-sqlite3@12.11.1": true,
