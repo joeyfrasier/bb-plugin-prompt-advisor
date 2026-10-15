@@ -1,7 +1,12 @@
 export const DEFAULT_PAUSE_MS = 60_000;
 // Automatic reviews never run closer together than this, whatever the pause.
 export const MIN_AUTOMATIC_GAP_MS = 15_000;
-export const REVIEW_SHORTCUT = { key: "r", mod: true, shift: true } as const;
+// Physical Control on every platform: ⌘⇧R is hard reload in Mac browsers and Electron.
+export const REVIEW_SHORTCUT = {
+  key: "r",
+  control: true,
+  shift: true,
+} as const;
 
 /**
  * Whether a draft reads as finished enough to review automatically. Drafts
@@ -19,7 +24,7 @@ export function looksFinished(text: string): boolean {
 export function shortcutLabel(
   platform = typeof navigator === "undefined" ? "" : navigator.platform,
 ): string {
-  return /mac|iphone|ipad/i.test(platform) ? "⌘⇧R" : "Ctrl+Shift+R";
+  return /mac|iphone|ipad/i.test(platform) ? "⌃⇧R" : "Ctrl+Shift+R";
 }
 
 export function pauseLabel(ms: number): string {

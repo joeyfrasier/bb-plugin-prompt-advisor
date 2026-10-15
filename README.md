@@ -2,7 +2,7 @@
 
 A personal fork of [Prompt Enhancer](https://github.com/vburojevic/bb-plugin-prompt-enhancer) for BB 0.46+. It reviews the initial draft of a new thread and recommends changes to the task's model, reasoning, speed tier, project, and machine.
 
-Review on demand with **Ctrl+Shift+R** (**⌘⇧R** on macOS), **Review now**, or the composer's **Review prompt and settings** send-menu entry. The shortcut is a BB composer command, so it can be rebound in BB's keyboard settings. Automatic review also runs after one minute without typing, but only when the draft ends on a finished sentence (terminal punctuation, a closing quote or bracket, or a closed code fence); drafts that stop mid-sentence wait for you. Follow-up messages are unaffected.
+Review on demand with **Ctrl+Shift+R** (the Control key on macOS too, shown as ⌃⇧R), **Review now**, or the composer's **Review prompt and settings** send-menu entry. The shortcut is a BB composer command, so it can be rebound in BB's keyboard settings. Automatic review also runs after one minute without typing, but only when the draft ends on a finished sentence (terminal punctuation, a closing quote or bracket, or a closed code fence); drafts that stop mid-sentence wait for you. Follow-up messages are unaffected.
 
 The reviewer rewrites the draft into the prompt an agent should receive: goal first, the supplied context stated once, each request as its own instruction, and the deliverable and boundaries made explicit. It keeps your voice, scope, and authorization (an investigation never becomes permission to change things) and never completes an unfinished sentence or invents facts.
 

@@ -469,10 +469,10 @@ test("the review shortcut is a rebindable composer command that reviews unfinish
     { ...command.defaultShortcut },
     {
       key: "r",
-      mod: true,
+      mod: false,
       shift: true,
       meta: false,
-      control: false,
+      control: true,
       alt: false,
     },
   );

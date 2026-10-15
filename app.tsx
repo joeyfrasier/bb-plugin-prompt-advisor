@@ -706,7 +706,7 @@ function ReviewBanner() {
             size="sm"
             variant={review ? "ghost" : "outline"}
             disabled={applying}
-            aria-keyshortcuts="Control+Shift+R Meta+Shift+R"
+            aria-keyshortcuts="Control+Shift+R"
             onClick={() => void start()}
           >
             {failure ? "Retry review" : review ? "Review again" : "Review now"}

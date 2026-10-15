@@ -104,7 +104,7 @@ export default async function plugin(bb: BbPluginApi) {
       type: "boolean",
       label: "Automatically review new-thread prompts",
       description:
-        "Review after a pause in typing, only when the draft ends on a finished sentence. Review on demand with Ctrl/⌘+Shift+R or Review now. Draft and settings change only when you apply a recommendation.",
+        "Review after a pause in typing, only when the draft ends on a finished sentence. Review on demand with Ctrl+Shift+R (Control on macOS too) or Review now. Draft and settings change only when you apply a recommendation.",
       default: true,
     },
     debounceMs: {

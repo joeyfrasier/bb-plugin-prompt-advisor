@@ -28,7 +28,7 @@ test("automatic review waits for a finished sentence", () => {
 });
 
 test("labels name the shortcut and pause", () => {
-  assert.equal(shortcutLabel("MacIntel"), "⌘⇧R");
+  assert.equal(shortcutLabel("MacIntel"), "⌃⇧R");
   assert.equal(shortcutLabel("Linux x86_64"), "Ctrl+Shift+R");
   assert.equal(pauseLabel(60000), "1 minute");
   assert.equal(pauseLabel(120000), "2 minutes");
