@@ -62,6 +62,63 @@ test("parses structured advice and preserves the draft references", () => {
   );
   assert.throws(() => parseReview(review(), "Fix src/b.ts", []), /references/);
 });
+
+test("accepts slash-prose rewrites while rejecting dropped real references", () => {
+  const original =
+    "Explain who/what can read/write using src/auth and ./foo/bar.";
+  const prompt = "Explain who can read and write using src/auth and ./foo/bar.";
+  const response = (text: string) =>
+    JSON.stringify({
+      prompt: text,
+      changes: ["Clarified the people and permissions"],
+      questions: [],
+      recommendations: [],
+    });
+  assert.equal(parseReview(response(prompt), original, []).prompt, prompt);
+  for (const reference of ["src/auth", "./foo/bar"]) {
+    assert.throws(
+      () =>
+        parseReview(response(prompt.replace(reference, "it")), original, []),
+      /dropped references/,
+    );
+  }
+  assert.throws(
+    () =>
+      parseReview(
+        response("Explain the alternatives."),
+        "Explain `who/what`.",
+        [],
+      ),
+    /dropped references/,
+  );
+  assert.throws(
+    () =>
+      parseReview(
+        response("Explain the alternatives."),
+        "Explain owner/team.",
+        ["owner/team"],
+      ),
+    /dropped references/,
+  );
+  assert.throws(
+    () =>
+      parseReview(
+        response("Check paths foo/bar."),
+        "Check paths foo/bar and baz/qux.",
+        [],
+      ),
+    /dropped references/,
+  );
+  assert.throws(
+    () =>
+      parseReview(
+        response("Check the relevant paths."),
+        "Check these paths:\n- foo/bar\n- baz/qux",
+        [],
+      ),
+    /dropped references/,
+  );
+});
 test("rejects unsupported reasoning and speed on the proposed machine", () => {
   const advice = parseReview(
     review([
