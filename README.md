@@ -29,7 +29,7 @@ Then click the spark in any composer, or press <kbd>⌘</kbd> <kbd>E</kbd> (<kbd
 >
 > ```sh
 > bb plugin install git:https://github.com/vburojevic/bb-plugin-prompt-enhancer.git@main
-> bb plugin install git:https://github.com/vburojevic/bb-plugin-prompt-enhancer.git@v0.2.6
+> bb plugin install git:https://github.com/vburojevic/bb-plugin-prompt-enhancer.git@v0.3.0
 > ```
 
 > [!NOTE]
