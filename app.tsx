@@ -15,11 +15,11 @@
 import { useEffect, useRef, useState } from "react";
 import {
   definePluginApp,
+  type ComposerDraft,
   useComposer,
-  useComposerView,
   useRealtime,
   useRpc,
-} from "@bb/plugin-sdk/app";
+} from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { rpcContract } from "./server";
 import { Icon } from "@/components/ui/icon";
@@ -51,6 +51,8 @@ import {
 } from "@/lib/references";
 import { scopeKey as scopeKeyOf } from "@/lib/scope-key";
 import { nextShown, REVEAL_TICK_MS } from "@/lib/reveal";
+import { reanchorMentions } from "@/lib/mentions";
+import { ReviewPanel } from "./review-panel";
 
 const isMac = navigator.platform.toUpperCase().includes("MAC");
 const SHORTCUT_HINT = isMac ? "⌘E" : "Ctrl+E";
@@ -71,15 +73,8 @@ interface EnhanceSignal {
   /** Present on "progress": the child thread's partial output so far. */
   text?: string;
 }
-type ReasoningLevel =
-  | "none"
-  | "low"
-  | "medium"
-  | "high"
-  | "xhigh"
-  | "ultracode"
-  | "max"
-  | "ultra";
+/** A provider's reasoning level id ("low", "xhigh", "minimal", …). */
+type ReasoningLevel = string;
 interface ModelOverride {
   providerId: string;
   model: string;
@@ -104,7 +99,7 @@ function levelLabel(level: ReasoningLevel): string {
   if (level === "xhigh") return "XHigh";
   return level.charAt(0).toUpperCase() + level.slice(1);
 }
-type ComposerScope = ReturnType<typeof useComposerView>["scope"];
+type ComposerScope = ReturnType<typeof useComposer>["scope"];
 
 /** One key per composer draft — see `lib/scope-key`. */
 function scopeKey(scope: ComposerScope): string {
@@ -126,6 +121,8 @@ function scopeKey(scope: ComposerScope): string {
 interface PendingRun {
   id: string;
   originalText: string;
+  /** The draft's @-mention pills at start, re-anchored on the rewrite. */
+  originalMentions: ComposerDraft["mentions"];
   previewGate: boolean;
   /** Absolute time after which the run is running longer than predicted. */
   deadline: number;
@@ -133,12 +130,6 @@ interface PendingRun {
   mentionLabels: readonly string[];
 }
 const pendingRuns = new Map<string, PendingRun>();
-
-/**
- * Latest structured @-mention labels per scope, from the composer's
- * richText observer — ground truth for the dropped-reference guard.
- */
-const mentionLabelsByScope = new Map<string, readonly string[]>();
 
 // ---------------------------------------------------------------------------
 // Animation styles — raw CSS because keyframes cannot come from the Tailwind
@@ -264,7 +255,6 @@ function prefersReducedMotion(): boolean {
 
 function EnhanceButton() {
   const composer = useComposer();
-  const view = useComposerView();
   const rpc = useRpc<typeof rpcContract>();
   const [busy, setBusy] = useState(false);
   const [cancelHover, setCancelHover] = useState(false);
@@ -282,7 +272,8 @@ function EnhanceButton() {
    * thread mid-reveal leaves the run adoptable and it re-types on return.
    */
   const deliveringIdRef = useRef<string | null>(null);
-  const originalTextRef = useRef<string>("");
+  /** The draft as it was when the run started: what Undo and abort restore. */
+  const originalDraftRef = useRef<ComposerDraft>({ text: "", mentions: [] });
   /** Whether the pending enhancement should preview instead of auto-apply. */
   const previewGateRef = useRef(false);
   /** Structured mention labels snapshotted when the pending run started. */
@@ -298,13 +289,13 @@ function EnhanceButton() {
   const revealTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const myScopeKey = scopeKey(view.scope);
+  const myScopeKey = scopeKey(composer.scope);
 
   // While busy the button stays enabled — it becomes the cancel button.
   // A running agent does NOT disable enhancing: drafting while the agent
   // works is exactly when a queued prompt gets refined.
-  const startDisabled = busy || view.draft.isEmpty;
-  const disabled = !busy && view.draft.isEmpty;
+  const startDisabled = busy || composer.isEmpty;
+  const disabled = !busy && composer.isEmpty;
 
   function stopTimers(): void {
     if (timeoutRef.current !== null) {
@@ -345,7 +336,7 @@ function EnhanceButton() {
     revealRef.current = null;
     if (!hadReveal) return;
     try {
-      composer.setText(originalTextRef.current);
+      composer.replace(originalDraftRef.current);
     } catch {
       // Composer gone; nothing to restore into.
     }
@@ -353,13 +344,14 @@ function EnhanceButton() {
 
   /** Success toast with a one-tap way back to the pre-rewrite draft. */
   function notifyEnhanced(enhanced: string): void {
-    const original = originalTextRef.current;
+    const originalDraft = originalDraftRef.current;
+    const original = originalDraft.text;
     toast.success("Prompt enhanced", {
       action: {
         label: "Undo",
         onClick: () => {
           try {
-            composer.setText(original);
+            composer.replace(originalDraft);
           } catch {
             // Composer scope is gone; nothing to restore into.
           }
@@ -409,11 +401,22 @@ function EnhanceButton() {
   }
 
   /**
+   * Write rewritten text into the draft with the original @-mention pills
+   * re-anchored on it. A plain-text write would flatten every pill.
+   */
+  function writeRewrite(text: string): void {
+    composer.replace({
+      text,
+      mentions: reanchorMentions(originalDraftRef.current, text),
+    });
+  }
+
+  /**
    * Feed text into the reveal engine. Called with partial output as it
    * arrives and with the final text (done=true); the engine types toward
    * whatever the current target is, easing out as it catches up, so one big
    * block and a trickle of chunks look equally alive. Any failure falls back
-   * to an instant setText — the rewrite must never be lost to an animation.
+   * to an instant write — the rewrite must never be lost to an animation.
    */
   function feedReveal(text: string, done: boolean): void {
     if (done) {
@@ -427,7 +430,7 @@ function EnhanceButton() {
     if (prefersReducedMotion()) {
       // Reduced motion: no typing choreography, content lands instantly.
       try {
-        composer.setText(text);
+        writeRewrite(text);
       } catch {
         // Composer gone mid-flight; the host released lock/effect.
       }
@@ -466,7 +469,7 @@ function EnhanceButton() {
       try {
         if (current.shown < current.target.length) {
           current.shown = nextShown(current.shown, current.target.length);
-          composer.setText(current.target.slice(0, current.shown));
+          writeRewrite(current.target.slice(0, current.shown));
         }
         if (current.done && current.shown >= current.target.length) {
           completeReveal(current.target);
@@ -475,7 +478,7 @@ function EnhanceButton() {
         // The composer went away mid-reveal (scope change/unmount) — land
         // the text if at all possible; never lose it to the animation.
         try {
-          composer.setText(current.target);
+          writeRewrite(current.target);
         } catch {
           // Truly gone.
         }
@@ -507,7 +510,7 @@ function EnhanceButton() {
       // so leaving with the dialog open brings the rewrite back on return.
       clearPending();
       deliveringIdRef.current = null;
-      setPreview({ id, original: originalTextRef.current, enhanced });
+      setPreview({ id, original: originalDraftRef.current.text, enhanced });
       return;
     }
     // The engine finishes typing whatever remains, then settles.
@@ -604,18 +607,23 @@ function EnhanceButton() {
   function adoptRun(run: {
     id: string;
     originalText: string;
+    originalMentions: ComposerDraft["mentions"];
     previewGate: boolean;
     deadline: number;
     mentionLabels: readonly string[];
   }): void {
     pendingIdRef.current = run.id;
     previewGateRef.current = run.previewGate;
-    originalTextRef.current = run.originalText;
+    originalDraftRef.current = {
+      text: run.originalText,
+      mentions: run.originalMentions,
+    };
     mentionLabelsRef.current = run.mentionLabels;
     revealRef.current = null;
     pendingRuns.set(myScopeKey, {
       id: run.id,
       originalText: run.originalText,
+      originalMentions: run.originalMentions,
       previewGate: run.previewGate,
       deadline: run.deadline,
       mentionLabels: run.mentionLabels,
@@ -650,7 +658,22 @@ function EnhanceButton() {
         // A newer run started elsewhere (another window) wins over the cached
         // one; the same run just refreshes the state adopted above.
         if (pendingIdRef.current !== run.id || cached === undefined) {
-          adoptRun(run);
+          // The server keeps only the trimmed text. The pills come from this
+          // window's cache, or from the draft itself while it still holds the
+          // original (it is locked for the whole run). The draft's own text
+          // goes with them: their offsets index into it, whitespace included.
+          const draft = composer.draft;
+          const original =
+            cached?.id === run.id
+              ? { text: cached.originalText, mentions: cached.originalMentions }
+              : draft.text.trim() === run.originalText
+                ? { text: draft.text, mentions: draft.mentions }
+                : { text: run.originalText, mentions: [] };
+          adoptRun({
+            ...run,
+            originalText: original.text,
+            originalMentions: original.mentions,
+          });
         }
         if (run.status === "done" && run.enhanced) {
           resolveDone(run.id, run.enhanced);
@@ -680,13 +703,11 @@ function EnhanceButton() {
     // Every composer flavor that knows its thread hands it over so the
     // enhancement inherits that thread's provider; only the new-thread
     // composer falls back to the project default.
-    const scope = view.scope;
+    const scope = composer.scope;
     const scopeThreadId =
       scope.kind === "thread" || scope.kind === "queued-message"
         ? scope.threadId
-        : scope.kind === "side-chat"
-          ? (scope.childThreadId ?? scope.parentThreadId)
-          : null;
+        : null;
     const scopeProjectId = scope.kind === "new-thread" ? scope.projectId : null;
     // Read the preview toggle fresh per run so a settings change applies to
     // the very next enhancement, not the next window load.
@@ -694,8 +715,10 @@ function EnhanceButton() {
       .call("getPrefs")
       .then((prefs) => prefs.previewBeforeApply)
       .catch(() => false);
-    const mentionLabels = mentionLabelsByScope.get(myScopeKey) ?? [];
-    const originalText = composer.text;
+    const { text: originalText, mentions: originalMentions } = composer.draft;
+    // The draft's structured @-mentions: ground truth for the dropped-reference
+    // guard, alongside the pills re-anchored on the rewrite.
+    const mentionLabels = originalMentions.map((mention) => mention.label);
     let id: string;
     let timeoutMs = FALLBACK_TIMEOUT_MS;
     try {
@@ -706,7 +729,7 @@ function EnhanceButton() {
         scopeKey: myScopeKey,
         threadId: scopeThreadId,
         projectId: scopeProjectId,
-        attachmentCount: view.draft.attachmentCount,
+        attachmentCount: composer.attachmentCount,
         previewGate: previewGateRef.current,
         mentionLabels: [...mentionLabels],
       }));
@@ -719,6 +742,7 @@ function EnhanceButton() {
     adoptRun({
       id,
       originalText,
+      originalMentions,
       previewGate: previewGateRef.current,
       deadline: Date.now() + timeoutMs,
       mentionLabels,
@@ -740,7 +764,7 @@ function EnhanceButton() {
     setPreview(null);
     ackRun(id);
     try {
-      composer.setText(enhanced);
+      writeRewrite(enhanced);
       composer.setTextEffect({ className: "prompt-enhancer-settle" });
       composer.focus();
     } catch {
@@ -793,15 +817,15 @@ function EnhanceButton() {
       className="flex items-center"
     >
       {/* Same idiom as the Prompts plugin's composer button, so the row
-          reads as one family: bordered 28px pill, muted-to-foreground on
-          hover, size-4 icon. On a coarse pointer it grows to 36x40 — the
+          reads as one family: borderless 28px ghost button like bb's own
+          composer controls, muted-to-foreground on hover, size-4 icon. On a coarse pointer it grows to 36x40 — the
           size BB's own composer actions (expand, prompt actions, voice)
           take there, so the row stays one family on touch too instead of
           leaving this the one 28px target among 40px neighbours. */}
       <button
         type="button"
         className={cn(
-          "flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-input",
+          "flex h-7 w-7 shrink-0 items-center justify-center rounded-md",
           "max-md:pointer-coarse:h-10 max-md:pointer-coarse:w-9",
           "text-muted-foreground transition-colors hover:bg-state-hover hover:text-foreground",
           "disabled:pointer-events-none disabled:opacity-50",
@@ -1145,17 +1169,10 @@ export default definePluginApp((app) => {
   });
   app.composer.customize({
     id: "prompt-enhancer",
-    actions: [{ id: "enhance", component: EnhanceButton }],
-    richText: {
-      // Ground truth for the dropped-reference guard: the composer's
-      // structured @-mentions, tracked per scope as the draft changes.
-      onDraftChange(draft, view) {
-        mentionLabelsByScope.set(
-          scopeKey(view.scope),
-          draft.mentions.map((mention) => mention.label),
-        );
-      },
-    },
+    actions: [
+      { id: "enhance", component: EnhanceButton },
+      { id: "review", component: ReviewPanel },
+    ],
   });
   // Keyframes for the busy shimmer and the settle sweep. The Tailwind pass
   // cannot emit raw keyframes, so a content script injects them and cleans

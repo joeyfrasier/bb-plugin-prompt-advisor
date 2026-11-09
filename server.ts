@@ -21,13 +21,32 @@
 // The user can pin an explicit provider+model for the enhancement thread on
 // the plugin's settings page; without an override the scope thread's provider
 // is inherited and the model stays at that provider's default.
-import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
+//
+// The review feature below ("Review now" / Ctrl+Shift+R) reuses this exact
+// hidden-child-thread machinery — spawn/retry, event-driven progress, cleanup
+// — rather than a second lifecycle. A review child rewrites the draft AND
+// proposes execution-setting changes (model/reasoningLevel/serviceTier); its
+// recommendations are validated against a catalog snapshot stored on the row
+// and applied by the frontend directly through the composer's own
+// `setSelection`, never through an RPC round trip.
+import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { buildEnhancePrompt } from "./lib/enhance-prompt";
 import { adaptiveTimeoutMs } from "./lib/adaptive-timeout";
-import { startSerialPoll } from "./lib/serial-poll";
+import {
+  answerSchema,
+  buildReviewPrompt,
+  catalogSchema as modelCatalogSchema,
+  parseReview,
+  reviewSchema,
+  reviewSelectionSchema,
+  type Answer,
+  type Catalog as ModelCatalog,
+  type ReviewSelection,
+} from "./lib/review";
 
 const REALTIME_CHANNEL = "prompt-enhancer";
+const REVIEW_CHANNEL = "prompt-advisor-review";
 const OVERRIDE_KEY = "model-override";
 const CATALOG_TTL_MS = 60_000;
 /** Persisted catalog survives plugin reloads so handlers never cold-fetch. */
@@ -87,17 +106,13 @@ const resumeRunSchema = z.object({
   error: z.string().nullable(),
 });
 
-/** bb's reasoning levels, as accepted by threads.spawn. */
-const reasoningLevelSchema = z.enum([
-  "none",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "ultracode",
-  "max",
-  "ultra",
-]);
+/**
+ * A reasoning level id as the provider lists it ("low", "xhigh", "minimal",
+ * …). Providers define their own ids and threads.spawn takes any of them, so
+ * this is not a fixed list: one unfamiliar id used to fail the whole model
+ * catalog, which left the settings picker empty.
+ */
+const reasoningLevelSchema = z.string().min(1).max(64);
 
 const modelOverrideSchema = z.object({
   providerId: z.string().min(1),
@@ -107,11 +122,19 @@ const modelOverrideSchema = z.object({
 });
 type ModelOverride = z.infer<typeof modelOverrideSchema>;
 
-/** How often the child thread's partial output is polled while pending. */
-const PROGRESS_POLL_MS = 400;
-/** Progress polling stops unconditionally after this long (outlives the
- * largest adaptive timeout so a slow run keeps painting to the end). */
+/** A run still pending this long after it started is stopped, however many
+ * children it went through (outlives the largest adaptive timeout so a slow
+ * run keeps painting to the end). The composer stays locked until then. */
 const PROGRESS_MAX_MS = 190_000;
+/** Same ceiling for a review run; reviews do not learn an adaptive timeout
+ * (there is no per-run "model key" history to adapt from), so this is fixed. */
+const REVIEW_MAX_MS = 180_000;
+/**
+ * How long a child's event stream must stay quiet, with output written,
+ * before that output counts as the rewrite. thread.idle normally lands well
+ * before this; it is the fallback for a provider slow to tear down.
+ */
+const PROGRESS_QUIET_MS = 1_500;
 
 /** Tail of the scope thread's last output shown to the rewriter as context. */
 const CONTEXT_OUTPUT_CAP = 1500;
@@ -120,28 +143,9 @@ const CONTEXT_OUTPUT_CAP = 1500;
  * How long a finished-but-undelivered run stays adoptable. Coming back to a
  * thread a minute later should still land the rewrite; coming back tomorrow
  * should not dump a forgotten one into a draft the user has moved on from.
+ * Shared by enhance's resumeForScope and review's resumeReviewForScope.
  */
 const RESUME_MAX_AGE_MS = 15 * 60_000;
-
-const modelCatalogSchema = z.object({
-  providers: z.array(
-    z.object({
-      id: z.string(),
-      displayName: z.string(),
-      models: z.array(
-        z.object({
-          model: z.string(),
-          displayName: z.string(),
-          isDefault: z.boolean(),
-          /** Reasoning levels this model supports, in bb's own order. */
-          reasoningLevels: z.array(reasoningLevelSchema),
-          defaultReasoningLevel: reasoningLevelSchema.nullable(),
-        }),
-      ),
-    }),
-  ),
-});
-type ModelCatalog = z.infer<typeof modelCatalogSchema>;
 
 export const rpcContract = defineRpcContract({
   startEnhance: {
@@ -199,7 +203,73 @@ export const rpcContract = defineRpcContract({
     input: z.null(),
     output: z.object({ previewBeforeApply: z.boolean() }),
   },
+  // -------------------------------------------------------------------------
+  // Review: "Review now" / Ctrl+Shift+R rewrites the draft AND proposes
+  // execution-setting changes. Recommendations are validated client-side
+  // (lib/review.ts has no SDK import) against the `catalog` snapshot
+  // returned below, then applied directly via the composer's own
+  // `setSelection` — there is no separate settings-validation RPC.
+  // -------------------------------------------------------------------------
+  startReview: {
+    input: z
+      .object({
+        scopeKey: z.string().min(1).max(500),
+        /** Opaque content identity for dedup/staleness; equal fingerprint and
+         * answers return the existing review instead of starting another. */
+        fingerprint: z.string().min(1).max(100_000),
+        text: z.string().min(1).max(100_000),
+        threadId: z.string().nullable(),
+        projectId: z.string().nullable(),
+        selection: reviewSelectionSchema,
+        mentionLabels: z.array(z.string().max(1000)).max(100),
+        attachmentCount: z.number().int().min(0).max(100),
+        /** Review this refines, when `answers` responds to its questions. */
+        refineFrom: z.string().max(200).optional(),
+        answers: z.array(answerSchema).min(1).max(3).optional(),
+      })
+      .strict()
+      .refine((x) => !x.answers === !x.refineFrom),
+    output: reviewRunSchema(),
+  },
+  getReview: {
+    input: z.object({ id: z.string() }).strict(),
+    output: reviewRunSchema().nullable(),
+  },
+  resumeReviewForScope: {
+    input: z.object({ scopeKey: z.string().min(1) }).strict(),
+    output: reviewRunSchema().nullable(),
+  },
+  dismissReview: {
+    input: z.object({ id: z.string() }).strict(),
+    output: z.object({}),
+  },
 });
+
+/** Hoisted above the contract so both `startReview` and `getReview` share one
+ * definition; a function (not a const) because it is referenced before the
+ * module body below defines it — TypeScript hoists function declarations. */
+function reviewRunSchema() {
+  return z.object({
+    id: z.string(),
+    scopeKey: z.string(),
+    fingerprint: z.string(),
+    original: z.string(),
+    selection: reviewSelectionSchema,
+    resolvedSelection: reviewSelectionSchema.nullable(),
+    mentionLabels: z.array(z.string()),
+    attachmentCount: z.number().int().min(0),
+    status: z.enum(["pending", "done", "error", "cancelled"]),
+    review: reviewSchema.nullable(),
+    /** The catalog this review's recommendations were made against; present
+     * only once the review is done, for client-side validateRecommendations. */
+    catalog: modelCatalogSchema.nullable(),
+    answers: z.array(answerSchema).nullable(),
+    error: z.string().nullable(),
+    createdAt: z.number(),
+    deadline: z.number(),
+  });
+}
+type ReviewRun = z.infer<ReturnType<typeof reviewRunSchema>>;
 
 interface EnhancementRow {
   id: string;
@@ -258,6 +328,83 @@ function toResumeRun(row: EnhancementRow): z.infer<typeof resumeRunSchema> {
   };
 }
 
+interface ReviewRow {
+  id: string;
+  scope_key: string;
+  fingerprint: string;
+  original: string;
+  selection: string;
+  resolved_selection: string | null;
+  mentions: string;
+  attachments: number;
+  child_id: string | null;
+  status: string;
+  review: string | null;
+  catalog: string | null;
+  error: string | null;
+  created_at: number;
+  deadline: number;
+  dismissed: number;
+  answers: string | null;
+  refine_from: string | null;
+}
+
+function toReviewRun(row: ReviewRow): ReviewRun {
+  return {
+    id: row.id,
+    scopeKey: row.scope_key,
+    fingerprint: row.fingerprint,
+    original: row.original,
+    selection: reviewSelectionSchema.parse(JSON.parse(row.selection)),
+    resolvedSelection: row.resolved_selection
+      ? reviewSelectionSchema.parse(JSON.parse(row.resolved_selection))
+      : null,
+    mentionLabels: JSON.parse(row.mentions) as string[],
+    attachmentCount: row.attachments,
+    status: row.status as ReviewRun["status"],
+    review: row.review ? reviewSchema.parse(JSON.parse(row.review)) : null,
+    catalog:
+      row.status === "done" && row.catalog
+        ? modelCatalogSchema.parse(JSON.parse(row.catalog))
+        : null,
+    answers: row.answers
+      ? z.array(answerSchema).parse(JSON.parse(row.answers))
+      : null,
+    error: row.error,
+    createdAt: row.created_at,
+    deadline: row.deadline,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Generic hidden-child-thread job: spawn/retry, event-driven progress, and
+// cleanup. Both the enhance feature (rewrite only) and the review feature
+// (rewrite + settings recommendations) run their child through the SAME
+// functions below, each via its own small JobRunner — the only
+// feature-specific code is how a row is read/written and what happens when
+// its text lands. Job ids are random UUIDs from two different tables but
+// share one id space in practice, so the shared `watches`/`spawnPlans` maps
+// below are keyed directly by id with no feature tag needed.
+// ---------------------------------------------------------------------------
+interface JobRow {
+  status: string;
+  childThreadId: string | null;
+  createdAt: number;
+}
+interface JobRunner {
+  readonly channel: string;
+  readonly maxDurationMs: number;
+  readonly timeoutMessage: string;
+  readonly emptyResultMessage: string;
+  getRow(id: string): JobRow | undefined;
+  setChildThread(id: string, childThreadId: string | null): void;
+  /** Record the child's finished output. May itself call `fail` (e.g. review
+   * parsing/validating its JSON) instead of succeeding. */
+  onDone(id: string, text: string, row: JobRow): void;
+  onFail(id: string, message: string): void;
+  /** Only the enhance feature learns an adaptive timeout per provider. */
+  onFallbackProvider?(id: string, providerId: string): void;
+}
 
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
@@ -272,7 +419,7 @@ export default async function plugin(bb: BbPluginApi) {
       type: "string",
       label: "Custom rewrite instructions",
       description:
-        "Extra instruction appended to every rewrite, e.g. \"keep prompts under 100 words\".",
+        "Extra instruction appended to every rewrite and review, e.g. \"keep prompts under 100 words\".",
     },
   });
   const db = bb.storage.database();
@@ -298,6 +445,31 @@ export default async function plugin(bb: BbPluginApi) {
     `ALTER TABLE enhancements ADD COLUMN mention_labels TEXT`,
     `CREATE INDEX IF NOT EXISTS enhancements_by_scope
        ON enhancements (scope_key, created_at)`,
+    // Review: same run-owned-by-scope shape as enhancements above, plus the
+    // settings-review fields (selection/resolved_selection/catalog) and
+    // refinement linkage (answers/refine_from).
+    `CREATE TABLE IF NOT EXISTS reviews (
+      id TEXT PRIMARY KEY,
+      scope_key TEXT NOT NULL,
+      fingerprint TEXT NOT NULL,
+      original TEXT NOT NULL,
+      selection TEXT NOT NULL,
+      resolved_selection TEXT,
+      mentions TEXT NOT NULL,
+      attachments INTEGER NOT NULL,
+      child_id TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      review TEXT,
+      catalog TEXT,
+      error TEXT,
+      created_at INTEGER NOT NULL,
+      deadline INTEGER NOT NULL,
+      dismissed INTEGER NOT NULL DEFAULT 0,
+      answers TEXT,
+      refine_from TEXT
+    )`,
+    `CREATE INDEX IF NOT EXISTS reviews_by_scope
+       ON reviews (scope_key, created_at)`,
   ]);
 
   const insertPending = db.prepare(
@@ -312,17 +484,25 @@ export default async function plugin(bb: BbPluginApi) {
      WHERE model_key = ? AND duration_ms IS NOT NULL
      ORDER BY created_at DESC LIMIT 12`,
   );
-  // History is diagnostic, not archival — keep the table bounded.
+  // History is diagnostic, not archival — keep the tables bounded.
   db.prepare(`DELETE FROM enhancements WHERE created_at < ?`).run(
     Date.now() - 7 * 24 * 60 * 60 * 1000,
   );
-  // Rows still pending at load lost their progress poller to a restart or a
+  db.prepare(`DELETE FROM reviews WHERE created_at < ?`).run(
+    Date.now() - 7 * 24 * 60 * 60 * 1000,
+  );
+  // Rows still pending at load lost their progress watch to a restart or a
   // plugin reload. Their child threads usually kept working, so these are
   // re-attached below rather than failed.
   const orphans = db
     .prepare(`SELECT * FROM enhancements WHERE status = 'pending'`)
     .all() as EnhancementRow[];
-  const setChildThread = db.prepare(
+  const reviewOrphans = db
+    .prepare(`SELECT * FROM reviews WHERE status = 'pending'`)
+    .all() as ReviewRow[];
+  /** A retry that moved to another provider learns under that provider's key. */
+  const setModelKey = db.prepare(`UPDATE enhancements SET model_key = ? WHERE id = ?`);
+  const setChildThreadStmt = db.prepare(
     `UPDATE enhancements SET child_thread_id = ? WHERE id = ?`,
   );
   const pendingByChild = db.prepare(
@@ -355,11 +535,48 @@ export default async function plugin(bb: BbPluginApi) {
      ORDER BY created_at DESC LIMIT 1`,
   );
 
+  // Review's own prepared statements, mirroring the shapes above.
+  const insertReview = db.prepare(
+    `INSERT INTO reviews (
+       id, scope_key, fingerprint, original, selection, mentions, attachments,
+       answers, refine_from, status, created_at, deadline
+     )
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+  );
+  const reviewById = db.prepare(`SELECT * FROM reviews WHERE id = ?`);
+  const reviewPendingByChild = db.prepare(
+    `SELECT * FROM reviews WHERE child_id = ? AND status = 'pending'`,
+  );
+  const latestReviewForScope = db.prepare(
+    `SELECT * FROM reviews WHERE scope_key = ? AND dismissed = 0
+     ORDER BY created_at DESC LIMIT 1`,
+  );
+  const setReviewChildStmt = db.prepare(
+    `UPDATE reviews SET child_id = ? WHERE id = ?`,
+  );
+  const setReviewCatalogAndResolved = db.prepare(
+    `UPDATE reviews SET catalog = ?, resolved_selection = ? WHERE id = ?`,
+  );
+  const markReviewDone = db.prepare(
+    `UPDATE reviews SET status = 'done', review = ? WHERE id = ? AND status = 'pending'`,
+  );
+  const markReviewError = db.prepare(
+    `UPDATE reviews SET status = 'error', error = ? WHERE id = ? AND status = 'pending'`,
+  );
+  const markReviewCancelled = db.prepare(
+    `UPDATE reviews SET status = 'cancelled' WHERE id = ? AND status = 'pending'`,
+  );
+  const markReviewDismissed = db.prepare(
+    `UPDATE reviews SET dismissed = 1 WHERE id = ?`,
+  );
+
+  let disposed = false;
+
   /**
-   * Hidden enhancement threads are single-use scratch space: once the row has
-   * its result (or is dead), the thread has no residual value and would only
-   * accumulate. Stop-then-delete, both best-effort — cleanup must never turn
-   * into a user-visible failure.
+   * Hidden enhancement/review threads are single-use scratch space: once the
+   * row has its result (or is dead), the thread has no residual value and
+   * would only accumulate. Stop-then-delete, both best-effort — cleanup must
+   * never turn into a user-visible failure.
    */
   function cleanupChildThread(threadId: string | null): void {
     if (threadId === null) return;
@@ -377,137 +594,372 @@ export default async function plugin(bb: BbPluginApi) {
     bb.realtime.publish(REALTIME_CHANNEL, { id, status });
   }
 
-  function fail(id: string, message: string) {
-    markError.run(message, id);
-    publish(id, "error");
+  function fail(runner: JobRunner, id: string, message: string): void {
+    runner.onFail(id, message);
+    forgetSpawnPlan(id);
+  }
+
+  /**
+   * What it takes to (re)spawn a job's child thread. A child can die before
+   * it writes a word — a provider that does not come up in time ("pi did not
+   * answer get_state in time" reaches us as "Command thread.start failed") —
+   * and that says nothing about the prompt, so such a run starts a fresh
+   * child instead of failing. In memory only: a run interrupted by a reload
+   * resolves through the orphan path below, as before. Shared by enhance and
+   * review: both spawn exactly one child the same way (inherit the scope
+   * thread's provider/environment, or the project default).
+   */
+  type SpawnPlan = {
+    projectId: string;
+    environment: SpawnEnvironment;
+    prompt: string;
+    override: ModelOverride | null;
+    inheritedProviderId: string | undefined;
+    attempts: number;
+    /** Providers whose child failed to start, so the fallback skips them. */
+    failedProviders: Set<string>;
+    lastProviderId: string | null;
+    /** When the current child was spawned; a retried run is timed from it. */
+    childStartedAt: number;
+  };
+  type SpawnEnvironment = Parameters<typeof bb.sdk.threads.spawn>[0]["environment"];
+  const spawnPlans = new Map<string, SpawnPlan>();
+  /** Runs whose child has written output: a failure after that is real. */
+  const producedOutput = new Set<string>();
+  /** The first spawn plus retries; the last one may switch provider. */
+  const MAX_START_ATTEMPTS = 3;
+  /** bb's system error when a thread's provider fails to start. */
+  const START_FAILURE_MESSAGE = "Command thread.start failed";
+  /** A failure cause longer than this is cut, so the error stays readable. */
+  const FAILURE_DETAIL_CAP = 300;
+  type ChildFailure = { message: string; detail: string | null };
+
+  function forgetSpawnPlan(id: string): void {
+    spawnPlans.delete(id);
+    producedOutput.delete(id);
+  }
+
+  /** The first catalog provider not in `exclude`, or null. Never throws. */
+  async function pickFallbackProvider(
+    exclude: ReadonlySet<string>,
+  ): Promise<string | null> {
+    try {
+      const catalog = await withTimeout(
+        loadModelCatalog(),
+        PROVIDER_CALL_TIMEOUT_MS,
+        "model catalog",
+      );
+      return catalog.providers.find((provider) => !exclude.has(provider.id))?.id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function spawnChild(
+    runner: JobRunner,
+    id: string,
+    plan: SpawnPlan,
+  ): Promise<void> {
+    plan.attempts += 1;
+    // The last attempt moves off a provider that already failed to start —
+    // unless the user picked the model themselves: that choice is kept.
+    const fallbackProviderId =
+      plan.override === null && plan.attempts === MAX_START_ATTEMPTS
+        ? await pickFallbackProvider(plan.failedProviders)
+        : null;
+    if (fallbackProviderId !== null) runner.onFallbackProvider?.(id, fallbackProviderId);
+    plan.childStartedAt = Date.now();
+    const child = await bb.sdk.threads.spawn({
+      projectId: plan.projectId,
+      environment: plan.environment,
+      // An explicit override wins. Otherwise inherit the scope thread's
+      // provider (model stays at that provider's default); on the
+      // new-thread composer omit both so spawn uses the project default.
+      ...(fallbackProviderId
+        ? { providerId: fallbackProviderId }
+        : plan.override
+          ? {
+              providerId: plan.override.providerId,
+              model: plan.override.model,
+              // Omitted → the model's own default reasoning level.
+              ...(plan.override.reasoningLevel
+                ? { reasoningLevel: plan.override.reasoningLevel }
+                : {}),
+            }
+          : plan.inheritedProviderId
+            ? { providerId: plan.inheritedProviderId }
+            : {}),
+      // Deliberately NOT parented to the scope thread: a hidden child
+      // reports its completion to its parent, which would inject the
+      // rewritten prompt into that thread's conversation. The rewrite
+      // belongs in the composer draft, never the timeline.
+      visibility: "hidden",
+      title: runner === enhanceRunner ? "Enhance prompt" : "Review prompt",
+      prompt: plan.prompt,
+    });
+    plan.lastProviderId = child.providerId ?? null;
+    runner.setChildThread(id, child.id);
+    // The user may have cancelled while spawn was in flight; the child is
+    // already running, so reap it here instead of leaking it.
+    const row = runner.getRow(id);
+    if (row === undefined || row.status !== "pending") {
+      cleanupChildThread(child.id);
+      forgetSpawnPlan(id);
+    } else {
+      startProgress(runner, id, child.id);
+    }
+  }
+
+  /**
+   * Why a child failed, from its latest error event. bb's `message` is often
+   * a category ("Command thread.start failed", "Provider error") and the
+   * cause is in `detail` ("pi did not answer get_state in time", "There's an
+   * issue with the selected model"). Never throws.
+   */
+  async function readChildFailure(
+    childThreadId: string,
+    reported: string | null,
+  ): Promise<ChildFailure> {
+    const fallback = reported ?? "The child thread failed";
+    try {
+      // Newest first: bb's default page is the OLDEST 100 events, and a
+      // child that streamed a long rewrite before failing has more than that.
+      const events = await bb.sdk.threads.events.list({
+        threadId: childThreadId,
+        order: "desc",
+        limit: "50",
+      });
+      const lastError = events.find((event) => event.type.includes("error"));
+      if (lastError === undefined) return { message: fallback, detail: null };
+      const data = lastError.data as { message?: unknown; text?: unknown; detail?: unknown };
+      const message = [data.message, data.text].find(
+        (value): value is string => typeof value === "string" && value.trim().length > 0,
+      );
+      const detail =
+        typeof data.detail === "string" && data.detail.trim().length > 0
+          ? data.detail.trim()
+          : null;
+      return { message: message ?? fallback, detail };
+    } catch {
+      return { message: fallback, detail: null };
+    }
+  }
+
+  /** The text the composer shows for a failed child: the cause when known. */
+  function describeFailure(failure: ChildFailure): string {
+    if (failure.detail === null) return failure.message;
+    const detail =
+      failure.detail.length > FAILURE_DETAIL_CAP
+        ? `${failure.detail.slice(0, FAILURE_DETAIL_CAP - 1)}…`
+        : failure.detail;
+    return failure.message === START_FAILURE_MESSAGE
+      ? `The provider did not start: ${detail}`
+      : detail;
+  }
+
+  /**
+   * A child thread failed. If it never wrote anything and attempts remain,
+   * start a fresh one; otherwise the run fails with the child's error.
+   */
+  function childFailed(
+    runner: JobRunner,
+    id: string,
+    childThreadId: string,
+    failure: ChildFailure,
+  ): void {
+    cleanupChildThread(childThreadId);
+    const row = runner.getRow(id);
+    // Only the first report for the run's current child acts. A late report
+    // about a replaced child must not stop the watch of the child that
+    // replaced it.
+    if (row === undefined || row.status !== "pending" || row.childThreadId !== childThreadId) {
+      return;
+    }
+    stopProgress(id);
+    const plan = spawnPlans.get(id);
+    if (
+      disposed ||
+      plan === undefined ||
+      // Only a provider that never came up is worth another try. A rate
+      // limit or an auth error would fail the same way again, and the user
+      // needs to see it now.
+      failure.message !== START_FAILURE_MESSAGE ||
+      producedOutput.has(id) ||
+      plan.attempts >= MAX_START_ATTEMPTS
+    ) {
+      fail(runner, id, describeFailure(failure));
+      return;
+    }
+    if (plan.lastProviderId !== null) plan.failedProviders.add(plan.lastProviderId);
+    runner.setChildThread(id, null);
+    bb.log.warn(
+      `${runner.channel} ${id}: child ${childThreadId} failed before writing (${describeFailure(failure)}); retrying`,
+    );
+    void spawnChild(runner, id, plan).catch((error: unknown) => {
+      try {
+        fail(runner, id, error instanceof Error ? error.message : String(error));
+      } catch {
+        // Stale handle mid-reload — nothing safe left to do.
+      }
+    });
   }
 
   // ---------------------------------------------------------------------
-  // Live progress: no delta events exist in the plugin SDK, so while an
-  // enhancement is pending we poll the child thread's partial output and
-  // relay growth to the composer. Chunky (~0.6s) but genuine tokens.
+  // Live progress: bb announces each advance of a thread's event sequence
+  // (experimental_thread.events, at most once a second per thread). Each
+  // announcement for a pending child reads its assembled output and relays
+  // growth to the composer. Completion and failure arrive as thread.idle and
+  // thread.failed below; nothing polls the child.
   // ---------------------------------------------------------------------
-  const progressTimers = new Map<string, () => void>();
-  let disposed = false;
+  type ProgressWatch = {
+    childThreadId: string;
+    /** Longest output relayed so far; only growth is published. */
+    lastSeen: string;
+    /** A read is running; `again` asks for one more once it ends. */
+    reading: boolean;
+    again: boolean;
+    quietTimer: ReturnType<typeof setTimeout> | null;
+    capTimer: ReturnType<typeof setTimeout>;
+  };
+  const watches = new Map<string, ProgressWatch>();
   bb.onDispose(() => {
     disposed = true;
-    for (const stop of progressTimers.values()) stop();
-    progressTimers.clear();
+    for (const id of [...watches.keys()]) stopProgress(id);
   });
 
   function stopProgress(id: string): void {
-    const timer = progressTimers.get(id);
-    if (timer !== undefined) {
-      timer();
-      progressTimers.delete(id);
-    }
+    const watch = watches.get(id);
+    if (watch === undefined) return;
+    if (watch.quietTimer !== null) clearTimeout(watch.quietTimer);
+    clearTimeout(watch.capTimer);
+    watches.delete(id);
   }
 
-  /** Polls of unchanged non-empty output before it counts as the result. */
-  const PROGRESS_STABLE_POLLS = 3;
+  /** The run's result is in: record it (or fail it) and retire the child. */
+  function finalize(
+    runner: JobRunner,
+    id: string,
+    childThreadId: string,
+    text: string,
+  ): void {
+    stopProgress(id);
+    const row = runner.getRow(id);
+    if (row === undefined || row.status !== "pending" || row.childThreadId !== childThreadId) {
+      return;
+    }
+    const trimmed = text.trim();
+    if (trimmed.length === 0) {
+      fail(runner, id, runner.emptyResultMessage);
+    } else {
+      // onDone may itself call fail() (review parses/validates its JSON and
+      // can reject it); forgetSpawnPlan/cleanup below are safe either way.
+      runner.onDone(id, trimmed, row);
+    }
+    forgetSpawnPlan(id);
+    cleanupChildThread(childThreadId);
+  }
 
-  function startProgress(id: string, childThreadId: string): void {
+  function startProgress(runner: JobRunner, id: string, childThreadId: string): void {
     if (disposed) return;
     stopProgress(id);
-    const startedAt = Date.now();
-    let lastSeen = "";
-    let stablePolls = 0;
-
-    function finalize(row: EnhancementRow, text: string): void {
-      stopProgress(id);
-      const enhanced = text.trim();
-      if (enhanced.length === 0) {
-        fail(id, "The enhancement thread returned an empty response");
-      } else {
-        markDone.run(enhanced, Date.now() - row.created_at, id);
-        publish(id, "done");
-      }
-      cleanupChildThread(childThreadId);
-    }
-
-    const timer = startSerialPoll(async (isStopped) => {
-      try {
-        const row = byId.get(id) as EnhancementRow | undefined;
-        if (row === undefined || row.status !== "pending") {
-          stopProgress(id);
-          return;
-        }
-        if (Date.now() - startedAt > PROGRESS_MAX_MS) {
-          // Give the row a terminal state instead of abandoning it as
-          // pending forever: a client resuming this scope must learn that
-          // the run is dead rather than wait on it indefinitely.
-          stopProgress(id);
-          fail(id, "The enhancement took too long and was stopped");
+    // Counted from the run's start, not this child's: a retried child or a
+    // child reattached after a reload must not restart the clock.
+    const startedAt = runner.getRow(id)?.createdAt ?? Date.now();
+    const watch: ProgressWatch = {
+      childThreadId,
+      lastSeen: "",
+      reading: false,
+      again: false,
+      quietTimer: null,
+      capTimer: setTimeout(() => {
+        if (watches.get(id) !== watch) return;
+        // Give the row a terminal state instead of abandoning it as pending
+        // forever: a client resuming this scope must learn that the run is
+        // dead rather than wait on it indefinitely.
+        stopProgress(id);
+        try {
+          const row = runner.getRow(id);
+          if (row?.status !== "pending" || row.childThreadId !== childThreadId) return;
+          fail(runner, id, runner.timeoutMessage);
           cleanupChildThread(childThreadId);
-          return;
+        } catch {
+          // Stale handle mid-reload — nothing safe left to do.
         }
-        const { output } = await bb.sdk.threads.output({
-          threadId: childThreadId,
-        });
-        if (isStopped()) return;
-        const text = output ?? "";
-        if (text.length > lastSeen.length) {
-          // Monotonic: only growth is relayed, so the composer never sees
-          // the text shrink or flicker between event-assembly states.
-          bb.realtime.publish(REALTIME_CHANNEL, {
-            id,
-            status: "progress",
-            text,
-          });
-        }
-        stablePolls = text.length > 0 && text === lastSeen ? stablePolls + 1 : 0;
-        lastSeen = text;
-        // Optimistic finish: output is assembled from COMPLETED messages
-        // only, so non-empty text that stays unchanged across several
-        // polls IS the rewrite — the thread just spends multiple further
-        // seconds in provider teardown before thread.idle fires, which
-        // previously left the composer locked and the pill spinning long
-        // after the full text had painted. The idle check below and the
-        // lifecycle events remain as fallbacks (all status-guarded).
-        if (stablePolls >= PROGRESS_STABLE_POLLS) {
-          finalize(row, text);
-          return;
-        }
+      }, Math.max(0, startedAt + runner.maxDurationMs - Date.now())),
+    };
+    watches.set(id, watch);
+    // Output written before this watch existed (a reattached orphan, or
+    // events that beat the spawn reply) has no announcement left to come.
+    void readProgress(runner, id, watch);
+    // Nor does an end that beat it: thread.idle or thread.failed found no
+    // row for this child yet, so ask once where it stands.
+    void (async () => {
+      try {
         const child = await bb.sdk.threads.get({ threadId: childThreadId });
-        if (isStopped()) return;
+        if (watches.get(id) !== watch) return;
         if (child.status === "idle") {
-          finalize(row, text);
+          const { output } = await bb.sdk.threads.output({ threadId: childThreadId });
+          finalize(runner, id, childThreadId, output ?? "");
         } else if (child.status === "error") {
           stopProgress(id);
-          // The child's own error (rate limit, out of credits, provider
-          // failure) is what the user needs to see — a generic "failed"
-          // sends them digging through a thread that is about to be
-          // deleted. thread.failed carries the same text as a fallback.
-          let message = "The enhancement thread failed";
-          try {
-            const events = await bb.sdk.threads.events.list({
-              threadId: childThreadId,
-            });
-            if (disposed) return;
-            const lastError = [...events]
-              .reverse()
-              .find((event) => event.type.includes("error"));
-            const detail =
-              lastError === undefined
-                ? null
-                : ((lastError.data as { message?: string; text?: string })
-                    .message ??
-                  (lastError.data as { text?: string }).text ??
-                  null);
-            if (detail) message = detail;
-          } catch {
-            // Keep the generic message.
-          }
-          fail(id, message);
-          cleanupChildThread(childThreadId);
+          const failure = await readChildFailure(childThreadId, null);
+          if (disposed) return;
+          childFailed(runner, id, childThreadId, failure);
         }
       } catch {
-        // Stale handle or the child is gone — either way stop polling;
-        // the lifecycle events still resolve the enhancement.
-        stopProgress(id);
+        // Unreachable child: the events and the cap timer still resolve it.
       }
-    }, PROGRESS_POLL_MS);
-    progressTimers.set(id, timer);
+    })();
+  }
+
+  /**
+   * Reads a pending child's output once and relays growth. Reads for one run
+   * never overlap: an announcement during a read schedules one more read.
+   */
+  async function readProgress(runner: JobRunner, id: string, watch: ProgressWatch): Promise<void> {
+    if (watch.reading) {
+      watch.again = true;
+      return;
+    }
+    watch.reading = true;
+    try {
+      do {
+        watch.again = false;
+        const { output } = await bb.sdk.threads.output({
+          threadId: watch.childThreadId,
+        });
+        if (watches.get(id) !== watch) return;
+        const text = output ?? "";
+        if (text.length > 0) producedOutput.add(id);
+        if (text.length > watch.lastSeen.length) {
+          // Monotonic: only growth is relayed, so the composer never sees
+          // the text shrink or flicker between event-assembly states.
+          watch.lastSeen = text;
+          bb.realtime.publish(runner.channel, { id, status: "progress", text });
+        }
+        // Optimistic finish: output is assembled from COMPLETED messages
+        // only, so written output followed by a quiet event stream IS the
+        // rewrite, even when the provider takes a while to tear down before
+        // thread.idle. Every announcement restarts the wait.
+        if (watch.quietTimer !== null) clearTimeout(watch.quietTimer);
+        watch.quietTimer =
+          watch.lastSeen.trim().length > 0
+            ? setTimeout(() => {
+                if (watches.get(id) !== watch || watch.reading) return;
+                try {
+                  finalize(runner, id, watch.childThreadId, watch.lastSeen);
+                } catch {
+                  // Stale handle mid-reload — nothing safe left to do.
+                }
+              }, PROGRESS_QUIET_MS)
+            : null;
+      } while (watch.again && watches.get(id) === watch);
+    } catch {
+      // Stale handle or the child is gone. thread.idle / thread.failed still
+      // resolve the run, and the cap timer bounds it.
+    } finally {
+      watch.reading = false;
+    }
   }
 
   /**
@@ -515,45 +967,60 @@ export default async function plugin(bb: BbPluginApi) {
    * is a real bb thread and does NOT stop when this plugin does, so failing
    * these outright threw away rewrites that were still being written — the
    * same loss the user sees on a thread switch, one layer down. Re-attach a
-   * poller to every child that is still there; only fail the ones whose child
+   * watch to every child that is still there; only fail the ones whose child
    * is genuinely gone (or was never spawned, because the crash beat spawn).
    *
    * Detached and fully guarded: this runs during plugin load, where an
    * escaping rejection would take the whole load down with it.
    */
-  void (async () => {
-    for (const orphan of orphans) {
+  async function reattachOrphans(
+    runner: JobRunner,
+    rows: readonly { id: string; childThreadId: string | null }[],
+  ): Promise<void> {
+    for (const orphan of rows) {
       try {
-        if (orphan.child_thread_id === null) {
-          fail(orphan.id, "Interrupted by a restart");
+        if (orphan.childThreadId === null) {
+          fail(runner, orphan.id, "Interrupted by a restart");
           continue;
         }
         const child = await bb.sdk.threads.get({
-          threadId: orphan.child_thread_id,
+          threadId: orphan.childThreadId,
         });
         if (child.status === "error") {
-          fail(orphan.id, "The enhancement thread failed");
-          cleanupChildThread(orphan.child_thread_id);
+          // Failed while we were down: its thread.failed is not replayed, so
+          // read why from the child before it is deleted.
+          const failure = await readChildFailure(orphan.childThreadId, null);
+          fail(runner, orphan.id, describeFailure(failure));
+          cleanupChildThread(orphan.childThreadId);
           continue;
         }
-        // Idle children resolve on the poller's very first tick, so the same
-        // path covers "finished while we were down" and "still writing".
-        startProgress(orphan.id, orphan.child_thread_id);
+        if (child.status === "idle") {
+          // Finished while we were down: its thread.idle is not replayed.
+          const { output } = await bb.sdk.threads.output({
+            threadId: orphan.childThreadId,
+          });
+          finalize(runner, orphan.id, orphan.childThreadId, output ?? "");
+          continue;
+        }
+        // Still writing: watch it like a fresh child.
+        startProgress(runner, orphan.id, orphan.childThreadId);
       } catch {
         // The child thread is unreachable or deleted; nothing will ever
         // resolve this row, so give it a terminal state now.
         try {
-          fail(orphan.id, "Interrupted by a restart");
+          fail(runner, orphan.id, "Interrupted by a restart");
         } catch {
           // Stale handle mid-reload — nothing safe left to do.
         }
       }
     }
-  })();
+  }
 
   // Provider/model catalog. Menu opens always answer from cache; a stale
   // cache is served immediately and refreshed in the background
-  // (stale-while-revalidate), and concurrent loads share one fetch.
+  // (stale-while-revalidate), and concurrent loads share one fetch. Shared
+  // by the enhance feature's listModels AND review's settings
+  // recommendations — one catalog, one cache, one fetch.
   let catalogCache: { at: number; catalog: ModelCatalog } | null = null;
   let catalogInflight: Promise<ModelCatalog> | null = null;
 
@@ -588,6 +1055,12 @@ export default async function plugin(bb: BbPluginApi) {
                 (entry) => entry.reasoningEffort,
               ),
               defaultReasoningLevel: model.defaultReasoningEffort ?? null,
+              // Only the review feature recommends a service tier today, but
+              // this is the same catalog the enhance picker reads, so the
+              // field is always populated rather than fetched twice.
+              serviceTiers: (model.supportedServiceTiers ?? []).map(
+                (tier) => tier.id,
+              ),
             })),
           };
         }),
@@ -652,6 +1125,118 @@ export default async function plugin(bb: BbPluginApi) {
   void refreshCatalog().catch(() => {});
 
   /**
+   * What a scope thread (or the new-thread composer) resolves to for a
+   * hidden child: where it runs (environment), which project owns it, and —
+   * when there is a scope thread — its provider, title, and recent output.
+   * Shared by the enhance feature's `runEnhance` and review's `runReview`:
+   * both spawn exactly one hidden child the same way.
+   */
+  async function resolveSpawnTarget(
+    threadId: string | null,
+    projectId: string | null,
+  ): Promise<{
+    resolvedProjectId: string | null;
+    environment: SpawnEnvironment;
+    providerId: string | undefined;
+    threadTitle: string | null;
+    lastOutput: string | null;
+  }> {
+    let resolvedProjectId = projectId;
+    let scopeEnvironmentId: string | null = null;
+    let providerId: string | undefined;
+    let threadTitle: string | null = null;
+    let lastOutput: string | null = null;
+    if (threadId !== null) {
+      const parent = await bb.sdk.threads.get({ threadId });
+      resolvedProjectId = parent.projectId;
+      scopeEnvironmentId = parent.environmentId;
+      providerId = parent.providerId;
+      threadTitle = parent.title ?? null;
+      // Context is best-effort: a rewrite without it is still correct, so
+      // an output fetch failure must never sink the run.
+      try {
+        const { output } = await withTimeout(
+          bb.sdk.threads.output({ threadId }),
+          PROVIDER_CALL_TIMEOUT_MS,
+          "threads.output",
+        );
+        if (output !== null && output.trim().length > 0) {
+          lastOutput = output.trim().slice(-CONTEXT_OUTPUT_CAP);
+        }
+      } catch {
+        // Proceed without conversation context.
+      }
+    }
+    let environment: SpawnEnvironment;
+    if (scopeEnvironmentId !== null) {
+      // Run in the scope thread's own workspace. "project-default" would
+      // provision a fresh git worktree (and branch) for every click in a
+      // git project, only to throw it away seconds later.
+      environment = { type: "reuse", environmentId: scopeEnvironmentId };
+    } else {
+      // New-thread composer (or a scope thread without a workspace yet):
+      // attach to the project's own checkout, which creates no worktree,
+      // branch or directory. Projects without a checkout (the personal
+      // project) keep bb's default.
+      const projects = await bb.sdk.projects.list();
+      // An unresolved project falls back to the first ordinary project so
+      // spawn still has a home.
+      const project =
+        resolvedProjectId === null
+          ? projects[0]
+          : projects.find((candidate) => candidate.id === resolvedProjectId);
+      resolvedProjectId = project?.id ?? resolvedProjectId;
+      const source =
+        project?.sources.find((candidate) => candidate.isDefault) ??
+        project?.sources[0];
+      environment = source
+        ? {
+            type: "host",
+            hostId: source.hostId,
+            workspace: { type: "unmanaged", path: null },
+          }
+        : { type: "project-default" };
+    }
+    return { resolvedProjectId, environment, providerId, threadTitle, lastOutput };
+  }
+
+  // -------------------------------------------------------------------------
+  // Enhance: rewrite only. See the module comment for the full design.
+  // -------------------------------------------------------------------------
+  const enhanceRunner: JobRunner = {
+    channel: REALTIME_CHANNEL,
+    maxDurationMs: PROGRESS_MAX_MS,
+    timeoutMessage: "The enhancement took too long and was stopped",
+    emptyResultMessage: "The enhancement thread returned an empty response",
+    getRow(id) {
+      const row = byId.get(id) as EnhancementRow | undefined;
+      return row
+        ? { status: row.status, childThreadId: row.child_thread_id, createdAt: row.created_at }
+        : undefined;
+    },
+    setChildThread(id, childThreadId) {
+      setChildThreadStmt.run(childThreadId, id);
+    },
+    onDone(id, text, row) {
+      // The duration teaches the adaptive timeout how long one child of
+      // this model takes. A retried run is timed from its last child, so the
+      // children that never started do not inflate the next timeout.
+      const plan = spawnPlans.get(id);
+      const startedAt =
+        plan !== undefined && plan.attempts > 1 ? plan.childStartedAt : row.createdAt;
+      markDone.run(text, Date.now() - startedAt, id);
+      publish(id, "done");
+    },
+    onFail(id, message) {
+      markError.run(message, id);
+      publish(id, "error");
+    },
+    onFallbackProvider(id, providerId) {
+      setModelKey.run(`inherit:${providerId}`, id);
+    },
+  };
+
+  /**
    * Detached kickoff. It MUST swallow every error itself: a stale bb handle or
    * a closed db after a plugin reload must never become an unhandled
    * rejection (PluginContextStaleError can crash the whole bb server).
@@ -664,36 +1249,8 @@ export default async function plugin(bb: BbPluginApi) {
     attachmentCount: number,
   ): Promise<void> {
     try {
-      let resolvedProjectId = projectId;
-      let providerId: string | undefined;
-      let threadTitle: string | null = null;
-      let lastOutput: string | null = null;
-      if (threadId !== null) {
-        const parent = await bb.sdk.threads.get({ threadId });
-        resolvedProjectId = parent.projectId;
-        providerId = parent.providerId;
-        threadTitle = parent.title ?? null;
-        // Context is best-effort: a rewrite without it is still correct, so
-        // an output fetch failure must never sink the enhancement.
-        try {
-          const { output } = await withTimeout(
-            bb.sdk.threads.output({ threadId }),
-            PROVIDER_CALL_TIMEOUT_MS,
-            "threads.output",
-          );
-          if (output !== null && output.trim().length > 0) {
-            lastOutput = output.trim().slice(-CONTEXT_OUTPUT_CAP);
-          }
-        } catch {
-          // Proceed without conversation context.
-        }
-      }
-      if (resolvedProjectId === null) {
-        // New-thread composer with an unresolved project: fall back to the
-        // first ordinary project so spawn still has a home.
-        const projects = await bb.sdk.projects.list();
-        resolvedProjectId = projects[0]?.id ?? null;
-      }
+      const { resolvedProjectId, environment, providerId, threadTitle, lastOutput } =
+        await resolveSpawnTarget(threadId, projectId);
       if (resolvedProjectId === null) {
         throw new Error("No project available to run the enhancement in");
       }
@@ -704,30 +1261,9 @@ export default async function plugin(bb: BbPluginApi) {
       const customRaw = (settingsValues.customInstructions ?? "").trim();
       // The builder caps the length itself; only presence matters here.
       const customInstructions = customRaw.length > 0 ? customRaw : null;
-      const child = await bb.sdk.threads.spawn({
+      const plan: SpawnPlan = {
         projectId: resolvedProjectId,
-        environment: { type: "project-default" },
-        // An explicit override wins. Otherwise inherit the scope thread's
-        // provider (model stays at that provider's default); on the
-        // new-thread composer omit both so spawn uses the project default.
-        ...(override
-          ? {
-              providerId: override.providerId,
-              model: override.model,
-              // Omitted → the model's own default reasoning level.
-              ...(override.reasoningLevel
-                ? { reasoningLevel: override.reasoningLevel }
-                : {}),
-            }
-          : providerId
-            ? { providerId }
-            : {}),
-        // Deliberately NOT parented to the scope thread: a hidden child
-        // reports its completion to its parent, which would inject the
-        // rewritten prompt into that thread's conversation. The rewrite
-        // belongs in the composer draft, never the timeline.
-        visibility: "hidden",
-        title: "Enhance prompt",
+        environment,
         prompt: buildEnhancePrompt(text, {
           kind: threadId === null ? "new-task" : "follow-up",
           attachmentCount,
@@ -735,21 +1271,131 @@ export default async function plugin(bb: BbPluginApi) {
           lastOutput,
           customInstructions,
         }),
-      });
-      setChildThread.run(child.id, id);
-      // The user may have cancelled while spawn was in flight; the child is
-      // already running, so reap it here instead of leaking it.
-      const row = byId.get(id) as EnhancementRow | undefined;
-      if (row === undefined || row.status !== "pending") {
-        cleanupChildThread(child.id);
-      } else {
-        startProgress(id, child.id);
-      }
+        override,
+        inheritedProviderId: providerId,
+        attempts: 0,
+        childStartedAt: Date.now(),
+        failedProviders: new Set(),
+        lastProviderId: null,
+      };
+      spawnPlans.set(id, plan);
+      await spawnChild(enhanceRunner, id, plan);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       try {
         bb.log.warn(`enhancement ${id} failed to start: ${message}`);
-        fail(id, message);
+        fail(enhanceRunner, id, message);
+      } catch {
+        // Stale handle mid-reload — nothing safe left to do.
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Review: rewrite + settings recommendations. See the module comment.
+  // -------------------------------------------------------------------------
+  const reviewRunner: JobRunner = {
+    channel: REVIEW_CHANNEL,
+    maxDurationMs: REVIEW_MAX_MS,
+    timeoutMessage: "The review took too long and was stopped",
+    emptyResultMessage:
+      "The reviewer returned no review. Retry; your draft is unchanged.",
+    getRow(id) {
+      const row = reviewById.get(id) as ReviewRow | undefined;
+      return row
+        ? { status: row.status, childThreadId: row.child_id, createdAt: row.created_at }
+        : undefined;
+    },
+    setChildThread(id, childThreadId) {
+      setReviewChildStmt.run(childThreadId, id);
+    },
+    onDone(id, text) {
+      // Unlike enhance, a review's "done" text is structured JSON that must
+      // parse and keep every live reference — onDone can still fail here.
+      const row = reviewById.get(id) as ReviewRow | undefined;
+      if (row === undefined) return;
+      try {
+        const mentionLabels = JSON.parse(row.mentions) as string[];
+        const parsed = parseReview(text, row.original, mentionLabels);
+        markReviewDone.run(JSON.stringify(parsed), id);
+        bb.realtime.publish(REVIEW_CHANNEL, { id, status: "done" });
+      } catch (error) {
+        fail(
+          reviewRunner,
+          id,
+          error instanceof Error
+            ? error.message
+            : "The reviewer returned an invalid review. Retry; your draft is unchanged.",
+        );
+      }
+    },
+    onFail(id, message) {
+      markReviewError.run(message, id);
+      bb.realtime.publish(REVIEW_CHANNEL, { id, status: "error" });
+    },
+  };
+
+  async function runReview(
+    id: string,
+    text: string,
+    threadId: string | null,
+    projectId: string | null,
+    selection: ReviewSelection,
+    attachmentCount: number,
+    refinement: { previousPrompt: string; answers: Answer[] } | null,
+  ): Promise<void> {
+    try {
+      const { resolvedProjectId, environment, providerId } = await resolveSpawnTarget(
+        threadId,
+        projectId,
+      );
+      if (resolvedProjectId === null) {
+        throw new Error("No project available to run the review in");
+      }
+      const catalog = await loadModelCatalog();
+      // Nulls in the composer's own selection (e.g. a new-thread composer
+      // that never picked a provider) resolve to what the child will
+      // actually inherit, so recommendations compare against real settings.
+      const resolvedSelection: ReviewSelection = {
+        providerId: selection.providerId ?? providerId ?? null,
+        model: selection.model,
+        reasoningLevel: selection.reasoningLevel,
+        serviceTier: selection.serviceTier,
+      };
+      setReviewCatalogAndResolved.run(
+        JSON.stringify(catalog),
+        JSON.stringify(resolvedSelection),
+        id,
+      );
+      const settingsValues = await settings.get();
+      const customInstructions = (settingsValues.customInstructions ?? "").trim();
+      const plan: SpawnPlan = {
+        projectId: resolvedProjectId,
+        environment,
+        prompt: buildReviewPrompt(
+          text,
+          resolvedSelection,
+          catalog,
+          attachmentCount,
+          customInstructions,
+          refinement,
+        ),
+        // Review always runs on the scope thread's own provider (or the
+        // project default) — there is no separate reviewer-model override.
+        override: null,
+        inheritedProviderId: providerId,
+        attempts: 0,
+        childStartedAt: Date.now(),
+        failedProviders: new Set(),
+        lastProviderId: null,
+      };
+      spawnPlans.set(id, plan);
+      await spawnChild(reviewRunner, id, plan);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      try {
+        bb.log.warn(`review ${id} failed to start: ${message}`);
+        fail(reviewRunner, id, message);
       } catch {
         // Stale handle mid-reload — nothing safe left to do.
       }
@@ -828,6 +1474,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (row === undefined || row.status !== "pending") return {};
       markCancelled.run(id);
       stopProgress(id);
+      forgetSpawnPlan(id);
       cleanupChildThread(row.child_thread_id);
       return {};
     },
@@ -877,27 +1524,162 @@ export default async function plugin(bb: BbPluginApi) {
       const settingsValues = await settings.get();
       return { previewBeforeApply: settingsValues.previewBeforeApply };
     },
+    async startReview({
+      scopeKey,
+      fingerprint,
+      text,
+      threadId,
+      projectId,
+      selection,
+      mentionLabels,
+      attachmentCount,
+      refineFrom,
+      answers,
+    }) {
+      const previous = latestReviewForScope.get(scopeKey) as ReviewRow | undefined;
+      const answersJson = answers ? JSON.stringify(answers) : null;
+      // Idempotent re-mount: the same content (and the same answers, for a
+      // refinement) returns the existing review instead of starting another.
+      if (
+        previous !== undefined &&
+        previous.fingerprint === fingerprint &&
+        previous.answers === answersJson &&
+        previous.status !== "error" &&
+        previous.status !== "cancelled"
+      ) {
+        return toReviewRun(previous);
+      }
+      if (previous !== undefined) {
+        markReviewDismissed.run(previous.id);
+        if (previous.status === "pending") {
+          markReviewCancelled.run(previous.id);
+          stopProgress(previous.id);
+          forgetSpawnPlan(previous.id);
+          cleanupChildThread(previous.child_id);
+        }
+      }
+      let refinement: { previousPrompt: string; answers: Answer[] } | null = null;
+      if (refineFrom !== undefined && answers !== undefined) {
+        const base = reviewById.get(refineFrom) as ReviewRow | undefined;
+        if (base === undefined || base.review === null || base.scope_key !== scopeKey) {
+          throw new Error(
+            "The review those answers belong to is no longer available. Review again.",
+          );
+        }
+        refinement = {
+          previousPrompt: reviewSchema.parse(JSON.parse(base.review)).prompt,
+          answers,
+        };
+      }
+      const id = crypto.randomUUID();
+      const now = Date.now();
+      insertReview.run(
+        id,
+        scopeKey,
+        fingerprint,
+        text,
+        JSON.stringify(selection),
+        JSON.stringify(mentionLabels),
+        attachmentCount,
+        answersJson,
+        refineFrom ?? null,
+        now,
+        now + REVIEW_MAX_MS,
+      );
+      // NON-BLOCKING: completion arrives via thread.idle / thread.failed below.
+      void runReview(id, text, threadId, projectId, selection, attachmentCount, refinement);
+      return toReviewRun(reviewById.get(id) as ReviewRow);
+    },
+    getReview({ id }) {
+      const row = reviewById.get(id) as ReviewRow | undefined;
+      return row ? toReviewRun(row) : null;
+    },
+    resumeReviewForScope({ scopeKey }) {
+      const row = latestReviewForScope.get(scopeKey) as ReviewRow | undefined;
+      return row && Date.now() - row.created_at < RESUME_MAX_AGE_MS ? toReviewRun(row) : null;
+    },
+    dismissReview({ id }) {
+      const row = reviewById.get(id) as ReviewRow | undefined;
+      if (row !== undefined) {
+        markReviewDismissed.run(id);
+        if (row.status === "pending") {
+          markReviewCancelled.run(id);
+          stopProgress(id);
+          forgetSpawnPlan(id);
+        }
+        cleanupChildThread(row.child_id);
+      }
+      return {};
+    },
+  });
+
+  bb.events.on("experimental_thread.events", ({ thread }) => {
+    try {
+      const enhancementRow = pendingByChild.get(thread.id) as EnhancementRow | undefined;
+      if (enhancementRow !== undefined) {
+        const watch = watches.get(enhancementRow.id);
+        if (watch !== undefined && watch.childThreadId === thread.id) {
+          void readProgress(enhanceRunner, enhancementRow.id, watch);
+        }
+        return;
+      }
+      const reviewRow = reviewPendingByChild.get(thread.id) as ReviewRow | undefined;
+      if (reviewRow !== undefined) {
+        const watch = watches.get(reviewRow.id);
+        if (watch !== undefined && watch.childThreadId === thread.id) {
+          void readProgress(reviewRunner, reviewRow.id, watch);
+        }
+      }
+    } catch {
+      // Stale handle mid-reload — nothing safe left to do.
+    }
   });
 
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
-    const row = pendingByChild.get(thread.id) as EnhancementRow | undefined;
-    if (!row) return;
-    stopProgress(row.id);
-    const enhanced = (lastAssistantText ?? "").trim();
-    if (enhanced.length === 0) {
-      fail(row.id, "The enhancement thread returned an empty response");
-    } else {
-      markDone.run(enhanced, Date.now() - row.created_at, row.id);
-      publish(row.id, "done");
+    const enhancementRow = pendingByChild.get(thread.id) as EnhancementRow | undefined;
+    if (enhancementRow !== undefined) {
+      finalize(enhanceRunner, enhancementRow.id, thread.id, lastAssistantText ?? "");
+      return;
     }
-    cleanupChildThread(thread.id);
+    const reviewRow = reviewPendingByChild.get(thread.id) as ReviewRow | undefined;
+    if (reviewRow !== undefined) {
+      finalize(reviewRunner, reviewRow.id, thread.id, lastAssistantText ?? "");
+    }
   });
 
-  bb.events.on("thread.failed", ({ thread, error }) => {
-    const row = pendingByChild.get(thread.id) as EnhancementRow | undefined;
-    if (!row) return;
-    stopProgress(row.id);
-    fail(row.id, error ?? "The enhancement thread failed");
-    cleanupChildThread(thread.id);
+  bb.events.on("thread.failed", async ({ thread, error }) => {
+    try {
+      const enhancementRow = pendingByChild.get(thread.id) as EnhancementRow | undefined;
+      if (enhancementRow !== undefined) {
+        stopProgress(enhancementRow.id);
+        // The child's own error (rate limit, out of credits, provider failure)
+        // is what the user needs to see — a generic "failed" sends them digging
+        // through a thread that is about to be deleted.
+        const failure = await readChildFailure(thread.id, error);
+        if (disposed) return;
+        childFailed(enhanceRunner, enhancementRow.id, thread.id, failure);
+        return;
+      }
+      const reviewRow = reviewPendingByChild.get(thread.id) as ReviewRow | undefined;
+      if (reviewRow !== undefined) {
+        stopProgress(reviewRow.id);
+        const failure = await readChildFailure(thread.id, error);
+        if (disposed) return;
+        childFailed(reviewRunner, reviewRow.id, thread.id, failure);
+      }
+    } catch {
+      // Stale handle mid-reload — nothing safe left to do.
+    }
   });
+
+  // Detached and fully guarded: reattachment runs during plugin load, where
+  // an escaping rejection would take the whole load down with it.
+  void reattachOrphans(
+    enhanceRunner,
+    orphans.map((row) => ({ id: row.id, childThreadId: row.child_thread_id })),
+  );
+  void reattachOrphans(
+    reviewRunner,
+    reviewOrphans.map((row) => ({ id: row.id, childThreadId: row.child_id })),
+  );
 }
