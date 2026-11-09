@@ -23,13 +23,23 @@ async function waitFor(check: () => boolean, label: string): Promise<void> {
   }
 }
 
-/** A loaded plugin with one scope thread and a child whose output we control. */
-async function setup() {
+/**
+ * A loaded plugin with one scope thread and a child whose output we control.
+ * `providers`, when given, seeds the catalog the plugin pre-warms at load —
+ * stubbing providers.list/models AFTER setup() is too late, since the
+ * catalog is already cached (with the default empty list) by then.
+ */
+async function setup(
+  providers?: {
+    list: () => Promise<unknown[]>;
+    models: (args?: { providerId?: string }) => Promise<unknown>;
+  },
+) {
   const child = { output: null as string | null, spawned: 0 };
   const { bb, harness } = createFakePluginHost({
     pluginId: "prompt-enhancer",
     sdk: {
-      providers: { list: async () => [] },
+      providers: providers ?? { list: async () => [] },
       projects: { list: async () => [] },
       threads: {
         get: async ({ threadId }: { threadId: string }) =>
@@ -104,7 +114,61 @@ async function setup() {
       thread: makeThreadResponse({ id: CHILD, projectId: "proj_1" }),
       sequence: 1,
     });
-  return { harness, child, childOutputReads, signals, start, startRpc, enhancement, settled, announce };
+  const startReviewRpc = (overrides: Record<string, unknown> = {}) =>
+    harness.behavior.callRpc("startReview", {
+      scopeKey: `thread/${SCOPE_THREAD}`,
+      fingerprint: "fp-1",
+      text: "fix the add bug pls",
+      threadId: SCOPE_THREAD,
+      projectId: null,
+      selection: {
+        providerId: null,
+        model: null,
+        reasoningLevel: null,
+        serviceTier: null,
+      },
+      mentionLabels: [],
+      attachmentCount: 0,
+      ...overrides,
+    }) as Promise<{ id: string; status: string }>;
+  async function startReview(
+    overrides: Record<string, unknown> = {},
+  ): Promise<string> {
+    const readsBefore = childOutputReads();
+    const { id } = await startReviewRpc(overrides);
+    await waitFor(() => childOutputReads() > readsBefore, "the first read of the review child");
+    return id;
+  }
+  async function getReview(id: string) {
+    return harness.behavior.callRpc("getReview", { id }) as Promise<{
+      status: string;
+      review: { prompt: string; recommendations: unknown[] } | null;
+      catalog: { providers: unknown[] } | null;
+      error: string | null;
+    }>;
+  }
+  async function settledReview(id: string, ms: number) {
+    const deadline = performance.now() + ms;
+    while ((await getReview(id))!.status === "pending" && performance.now() < deadline) {
+      await sleep(20);
+    }
+    return getReview(id);
+  }
+  return {
+    harness,
+    child,
+    childOutputReads,
+    signals,
+    start,
+    startRpc,
+    enhancement,
+    settled,
+    announce,
+    startReviewRpc,
+    startReview,
+    getReview,
+    settledReview,
+  };
 }
 
 test("reads the child only when bb announces new events, never on a timer", async () => {
@@ -316,4 +380,134 @@ test("a retried run teaches the timeout its last child's time, not the failed on
   const next = await startRpc();
   await harness.behavior.callRpc("cancelEnhance", { id: next.id });
   assert.equal(next.timeoutMs, 20_000);
+});
+
+// ---------------------------------------------------------------------------
+// Review: reuses the exact machinery exercised above (spawn/retry,
+// event-driven progress, cleanup) through the same fake host. These tests
+// cover the review-specific wiring: the structured-JSON child response,
+// catalog snapshotting, dropped-reference rejection, and the scope/dismiss
+// lifecycle — not the shared spawn/retry behavior, already covered above.
+// ---------------------------------------------------------------------------
+
+function reviewResponse(overrides: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    prompt: "Fix the add bug.",
+    changes: ["Named the outcome"],
+    questions: [],
+    recommendations: [],
+    ...overrides,
+  });
+}
+
+test("a review child's structured JSON becomes a stored, validated review", async () => {
+  const { harness, child, startReview, settledReview } = await setup({
+    list: async () => [
+      { id: "claude-code", displayName: "Claude Code", available: true },
+    ],
+    models: async () => ({
+      models: [
+        {
+          model: "sol",
+          displayName: "Sol",
+          isDefault: true,
+          description: "General coding",
+          supportedReasoningEfforts: [
+            { reasoningEffort: "low", description: "" },
+            { reasoningEffort: "high", description: "" },
+          ],
+          supportedServiceTiers: [{ id: "default" }, { id: "ultrafast" }],
+        },
+      ],
+    }),
+  });
+  const id = await startReview();
+  child.output = reviewResponse({
+    recommendations: [
+      {
+        field: "reasoningLevel",
+        value: "high",
+        reason: "Needs tool access",
+        confidence: 0.9,
+      },
+    ],
+  });
+  await harness.behavior.emitThreadEvent("thread.idle", {
+    thread: makeThreadResponse({ id: CHILD, projectId: "proj_1" }),
+    lastAssistantText: child.output,
+  });
+  const run = await settledReview(id, 1_000);
+  assert.equal(run!.status, "done");
+  assert.equal(run!.review?.prompt, "Fix the add bug.");
+  assert.equal(run!.review?.recommendations.length, 1);
+  // The catalog snapshot travels with the review so the client can validate
+  // recommendations itself, without a round trip back to the server.
+  assert.equal(run!.catalog?.providers.length, 1);
+});
+
+test("a review that drops a live reference fails instead of landing a bad rewrite", async () => {
+  const { harness, child, startReview, settledReview } = await setup();
+  const id = await startReview({ text: "fix src/add.ts please" });
+  child.output = reviewResponse({ prompt: "Fix it." });
+  await harness.behavior.emitThreadEvent("thread.idle", {
+    thread: makeThreadResponse({ id: CHILD, projectId: "proj_1" }),
+    lastAssistantText: child.output,
+  });
+  const run = await settledReview(id, 1_000);
+  assert.equal(run!.status, "error");
+  assert.match(run!.error ?? "", /dropped references/);
+});
+
+test("a review that returns unparseable text fails with a retry-friendly message", async () => {
+  const { harness, child, startReview, settledReview } = await setup();
+  const id = await startReview();
+  child.output = "not json at all";
+  await harness.behavior.emitThreadEvent("thread.idle", {
+    thread: makeThreadResponse({ id: CHILD, projectId: "proj_1" }),
+    lastAssistantText: child.output,
+  });
+  const run = await settledReview(id, 1_000);
+  assert.equal(run!.status, "error");
+  assert.match(run!.error ?? "", /Retry; your draft is unchanged/);
+});
+
+test("starting a review with the same fingerprint returns the existing one instead of starting another", async () => {
+  const { harness, child, startReviewRpc } = await setup();
+  const first = await startReviewRpc();
+  const second = await startReviewRpc();
+  assert.equal(first.id, second.id);
+  assert.equal(child.spawned, 1);
+  // The review is still pending; dismiss it so its cap timer does not
+  // outlive the test (every run started in a test must reach a terminal
+  // state or be dismissed, same discipline the enhance tests above follow).
+  await harness.behavior.callRpc("dismissReview", { id: first.id });
+});
+
+test("a new fingerprint cancels the previous pending review for the same scope", async () => {
+  const { harness, child, startReviewRpc } = await setup();
+  const first = await startReviewRpc();
+  const second = await startReviewRpc({ fingerprint: "fp-2", text: "a different draft" });
+  assert.notEqual(first.id, second.id);
+  const firstRow = (await harness.behavior.callRpc("getReview", {
+    id: first.id,
+  })) as { status: string };
+  assert.equal(firstRow.status, "cancelled");
+  assert.equal(child.spawned, 2);
+  // The second review is still pending; dismiss it so its cap timer does
+  // not outlive the test.
+  await harness.behavior.callRpc("dismissReview", { id: second.id });
+});
+
+test("resumeReviewForScope hands back the latest undismissed review for the scope", async () => {
+  const { harness, startReview } = await setup();
+  const id = await startReview();
+  const resumed = (await harness.behavior.callRpc("resumeReviewForScope", {
+    scopeKey: `thread/${SCOPE_THREAD}`,
+  })) as { id: string } | null;
+  assert.equal(resumed?.id, id);
+  await harness.behavior.callRpc("dismissReview", { id });
+  const afterDismiss = (await harness.behavior.callRpc("resumeReviewForScope", {
+    scopeKey: `thread/${SCOPE_THREAD}`,
+  })) as { id: string } | null;
+  assert.equal(afterDismiss, null);
 });
