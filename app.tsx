@@ -52,6 +52,7 @@ import {
 import { scopeKey as scopeKeyOf } from "@/lib/scope-key";
 import { nextShown, REVEAL_TICK_MS } from "@/lib/reveal";
 import { reanchorMentions } from "@/lib/mentions";
+import { ReviewPanel } from "./review-panel";
 
 const isMac = navigator.platform.toUpperCase().includes("MAC");
 const SHORTCUT_HINT = isMac ? "⌘E" : "Ctrl+E";
@@ -1168,7 +1169,10 @@ export default definePluginApp((app) => {
   });
   app.composer.customize({
     id: "prompt-enhancer",
-    actions: [{ id: "enhance", component: EnhanceButton }],
+    actions: [
+      { id: "enhance", component: EnhanceButton },
+      { id: "review", component: ReviewPanel },
+    ],
   });
   // Keyframes for the busy shimmer and the settle sweep. The Tailwind pass
   // cannot emit raw keyframes, so a content script injects them and cleans

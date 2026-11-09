@@ -14,6 +14,7 @@
     "jsxRuntime",
     "pluginSdkApp",
     "radixDialog",
+    "radixPopover",
     "react",
     "reactDom",
     "sonner",
